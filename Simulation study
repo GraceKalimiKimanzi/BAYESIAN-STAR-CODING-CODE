@@ -1,0 +1,399 @@
+Simulation
+#Simulate the ESTAR data
+
+set.seed(123)
+
+simulate_series <- function(n, phi, sigma2, gamma, c, d, burn = 500) {
+  
+  stopifnot(length(phi) == 6, n > 0, sigma2 > 0,
+            gamma > 0, d %in% c(1, 2))
+  
+  total <- n + burn
+  y <- numeric(total)
+  
+  y[1:2] <- rnorm(2, mean = 0, sd = sqrt(sigma2))
+  
+  for (t in 3:total) {
+    
+    z_lag <- y[t - d]
+    Gt <- 1 - exp(-gamma * (z_lag - c)^2)
+    
+    mu_t <- phi[1] +
+      phi[2] * y[t - 1] +
+      phi[3] * y[t - 2] +
+      (phi[4] +
+         phi[5] * y[t - 1] +
+         phi[6] * y[t - 2]) * Gt
+    
+    y[t] <- mu_t + rnorm(1, sd = sqrt(sigma2))
+  }
+  
+  y[(burn + 1):total]
+}
+
+phi_true <- c(0.01, 1.55, -0.88, 0.03, -1.05, 0.35)
+sigma2_true <- 0.08
+gamma_true <- 40
+c_true <- 0.08
+d_true <- 2
+n <- 2000
+
+y <- simulate_series(
+  n = n,
+  phi = phi_true,
+  sigma2 = sigma2_true,
+  gamma = gamma_true,
+  c = c_true,
+  d = d_true
+)
+
+stopifnot(all(is.finite(y)))
+
+plot(y, type = "l",
+     main = "Simulated ESTAR Data",
+     xlab = "Time", ylab = expression(y[t]))
+
+summary(y)
+range(y)
+acf(y, main = "ACF of Simulated ESTAR Data")
+
+#Construct the design matrix
+build_star_design <- function(y, p, d, gamma, c) {
+  
+  n <- length(y)
+  start <- max(p, d) + 1L
+  
+  Z <- matrix(0, nrow = n - start + 1L,
+              ncol = 2L * (p + 1L))
+  
+  for (t in start:n) {
+    
+    z_t <- y[t - d]
+    G <- 1 - exp(-gamma * (z_t - c)^2)
+    
+    lag_vec <- c(1, y[t - seq_len(p)])
+    
+    Z[t - start + 1L, ] <- c(lag_vec, lag_vec * G)
+  }
+  
+  Z
+}
+
+#Define the loglikelihood
+log_likelihood_star <- function(y, phi, sigma2, p, d, gamma, c) {
+  
+  if (!is.finite(sigma2) || sigma2 <= 0 ||
+      !is.finite(gamma) || gamma <= 0 ||
+      !is.finite(c) || d < 1 || d > p) {
+    return(-Inf)
+  }
+  
+  Z <- build_star_design(y, p, d, gamma, c)
+  start <- max(p, d) + 1L
+  y_dep <- y[start:length(y)]
+  
+  if (ncol(Z) != length(phi) ||
+      nrow(Z) != length(y_dep)) {
+    return(-Inf)
+  }
+  
+  mu <- as.vector(Z %*% phi)
+  if (any(!is.finite(mu))) return(-Inf)
+  
+  resid <- y_dep - mu
+  n_eff <- length(y_dep)
+  
+  -0.5 * n_eff * log(2 * pi * sigma2) -
+    sum(resid^2) / (2 * sigma2)
+}
+#Sample the autogregressive coefficients
+sample_phi <- function(y, p, sigma2, d, gamma, c,
+                       delta2 = 100) {
+  
+  Z <- build_star_design(y, p, d, gamma, c)
+  start <- max(p, d) + 1L
+  y_dep <- y[start:length(y)]
+  
+  if (!is.finite(sigma2) || sigma2 <= 0 ||
+      !is.finite(delta2) || delta2 <= 0) {
+    stop("Invalid variance or prior variance.")
+  }
+  
+  V_post <- solve(
+    crossprod(Z) / sigma2 +
+      diag(1 / delta2, ncol(Z))
+  )
+  
+  mu_post <- V_post %*% crossprod(Z, y_dep) / sigma2
+  
+  R <- chol(V_post)
+  as.vector(mu_post + t(R) %*% rnorm(ncol(Z)))
+}
+#Sample the error variance
+sample_sigma2 <- function(y, phi, p, d, gamma, c,
+                          A = 2, B = 0.1) {
+  
+  Z <- build_star_design(y, p, d, gamma, c)
+  start <- max(p, d) + 1L
+  y_dep <- y[start:length(y)]
+  
+  resid <- y_dep - as.vector(Z %*% phi)
+  
+  shape <- A + length(y_dep) / 2
+  rate <- B + sum(resid^2) / 2
+  
+  1 / rgamma(1, shape = shape, rate = rate)
+}
+#Sample the d parameter
+sample_delay <- function(y, phi, p, sigma2, gamma, c,
+                         dmax = p) {
+  
+  candidates <- seq_len(min(dmax, p))
+  log_prob <- vapply(candidates, function(dd) {
+    
+    ll <- log_likelihood_star(
+      y, phi, sigma2, p, dd, gamma, c
+    )
+    
+    ll + log(1 / length(candidates))
+    
+  }, numeric(1))
+  
+  if (!any(is.finite(log_prob))) {
+    stop("All delay-parameter likelihoods are invalid.")
+  }
+  
+  prob <- exp(log_prob - max(log_prob))
+  prob <- prob / sum(prob)
+  
+  sample(candidates, size = 1, prob = prob)
+}
+#metropolis update for gamma and c
+update_gamma_c <- function(y, phi, sigma2, p, d, gamma, c,
+                           sd_log_gamma = 0.05,
+                           sd_c = 0.02) {
+  
+  log_gamma_prop <- rnorm(
+    1, mean = log(gamma), sd = sd_log_gamma
+  )
+  gamma_prop <- exp(log_gamma_prop)
+  
+  c_prop <- rnorm(1, mean = c, sd = sd_c)
+  
+  ll_current <- log_likelihood_star(
+    y, phi, sigma2, p, d, gamma, c
+  )
+  
+  ll_prop <- log_likelihood_star(
+    y, phi, sigma2, p, d, gamma_prop, c_prop
+  )
+  
+  log_prior_gamma_current <- dgamma(
+    gamma, shape = 2, rate = 0.1, log = TRUE
+  )
+  log_prior_gamma_prop <- dgamma(
+    gamma_prop, shape = 2, rate = 0.1, log = TRUE
+  )
+  
+  log_prior_c_current <- dnorm(c, 0, 1, log = TRUE)
+  log_prior_c_prop <- dnorm(c_prop, 0, 1, log = TRUE)
+  
+  log_alpha <- (ll_prop - ll_current) +
+    (log_prior_gamma_prop - log_prior_gamma_current) +
+    (log_prior_c_prop - log_prior_c_current) +
+    (log_gamma_prop - log(gamma))
+  
+  accepted <- is.finite(log_alpha) &&
+    log(runif(1)) < min(0, log_alpha)
+  
+  if (accepted) {
+    return(list(
+      gamma = gamma_prop,
+      c = c_prop,
+      accepted = TRUE
+    ))
+  }
+  
+  list(
+    gamma = gamma,
+    c = c,
+    accepted = FALSE
+  )
+}
+
+#Complete Bayesian MCMC algorithm
+bayesian_star_mcmc <- function(
+    y, n_iter = 20000, p = 2, dmax = 2,
+    delta2 = 100, A = 2, B = 0.1,
+    init_phi = rep(0, 6),
+    init_sigma2 = NULL,
+    init_gamma = 20,
+    init_c = 0.05,
+    init_d = 2) {
+  
+  if (length(init_phi) != 2 * (p + 1)) {
+    stop("init_phi must have length 2*(p+1).")
+  }
+  
+  if (is.null(init_sigma2)) init_sigma2 <- var(y)
+  
+  sigma2 <- init_sigma2
+  phi <- init_phi
+  gamma <- init_gamma
+  c <- init_c
+  d <- init_d
+  
+  sigma_chain <- numeric(n_iter)
+  gamma_chain <- numeric(n_iter)
+  c_chain <- numeric(n_iter)
+  d_chain <- integer(n_iter)
+  phi_chain <- matrix(NA_real_, n_iter, length(phi))
+  
+  accept_gc <- 0L
+  
+  for (iter in seq_len(n_iter)) {
+    
+    phi <- sample_phi(
+      y, p, sigma2, d, gamma, c, delta2
+    )
+    
+    sigma2 <- sample_sigma2(
+      y, phi, p, d, gamma, c, A, B
+    )
+    
+    d <- sample_delay(
+      y, phi, p, sigma2, gamma, c, dmax
+    )
+    
+    gc <- update_gamma_c(
+      y, phi, sigma2, p, d, gamma, c
+    )
+    
+    gamma <- gc$gamma
+    c <- gc$c
+    accept_gc <- accept_gc + as.integer(gc$accepted)
+    
+    sigma_chain[iter] <- sigma2
+    gamma_chain[iter] <- gamma
+    c_chain[iter] <- c
+    d_chain[iter] <- d
+    phi_chain[iter, ] <- phi
+    
+    if (iter %% 1000 == 0) {
+      cat("Iteration:", iter, "of", n_iter, "\n")
+    }
+  }
+  
+  list(
+    sigma2 = sigma_chain,
+    gamma = gamma_chain,
+    c = c_chain,
+    d = d_chain,
+    phi = phi_chain,
+    acceptance_rate = accept_gc / n_iter
+  )
+}
+
+# Bayesian ESTAR model
+set.seed(456)
+
+results <- bayesian_star_mcmc(
+  y = y,
+  n_iter = 20000,
+  p = 2,
+  dmax = 2,
+  init_phi = rep(0, 6),
+  init_gamma = 20,
+  init_c = 0.05,
+  init_d = 2
+)
+
+results$acceptance_rate
+
+#Removing burn in and obtain posterior estimates
+burn <- 5000
+keep <- (burn + 1):length(results$gamma)
+
+gamma_post <- results$gamma[keep]
+c_post <- results$c[keep]
+sigma_post <- results$sigma2[keep]
+d_post <- results$d[keep]
+phi_post <- results$phi[keep, , drop = FALSE]
+
+# Compare true and estimated autoregressive coefficients
+phi_summary <- data.frame(
+  Parameter = paste0("phi_", 1:6),
+  True = phi_true,
+  Posterior_Mean = colMeans(phi_post),
+  Posterior_SD = apply(phi_post, 2, sd),
+  Lower_95 = apply(phi_post, 2, quantile, probs = 0.025),
+  Upper_95 = apply(phi_post, 2, quantile, probs = 0.975)
+)
+
+print(round(phi_summary[, -1], 4))
+phi_summary
+
+# Summaries of the other parameters
+parameter_summary <- data.frame(
+  Parameter = c("sigma2", "gamma", "c", "d"),
+  Posterior_Mean = c(
+    mean(sigma_post),
+    mean(gamma_post),
+    mean(c_post),
+    mean(d_post)
+  ),
+  Posterior_SD = c(
+    sd(sigma_post),
+    sd(gamma_post),
+    sd(c_post),
+    sd(d_post)
+  ),
+  Lower_95 = c(
+    quantile(sigma_post, 0.025),
+    quantile(gamma_post, 0.025),
+    quantile(c_post, 0.025),
+    quantile(d_post, 0.025)
+  ),
+  Upper_95 = c(
+    quantile(sigma_post, 0.975),
+    quantile(gamma_post, 0.975),
+    quantile(c_post, 0.975),
+    quantile(d_post, 0.975)
+  )
+)
+
+print(parameter_summary)
+
+# Posterior probabilities for d
+print(prop.table(table(d_post)))
+
+# Acceptance rate
+results$acceptance_rate
+
+#Convergence check
+par(mfrow = c(2, 3))
+
+plot(gamma_post, type = "l",
+     main = "Trace: gamma", ylab = "gamma")
+
+plot(c_post, type = "l",
+     main = "Trace: c", ylab = "c")
+
+plot(sigma_post, type = "l",
+     main = "Trace: sigma squared", ylab = "sigma2")
+
+plot(d_post, type = "s",
+     main = "Trace: d", ylab = "d")
+
+plot(phi_post[, 2], type = "l",
+     main = "Trace: phi2", ylab = "phi2")
+
+plot(phi_post[, 5], type = "l",
+     main = "Trace: phi5", ylab = "phi5")
+
+par(mfrow = c(1, 1))
+
+acf(gamma_post, main = "ACF: gamma")
+acf(c_post, main = "ACF: c")
+acf(sigma_post, main = "ACF: sigma squared")
+acf(phi_post[, 2], main = "ACF: phi2")
